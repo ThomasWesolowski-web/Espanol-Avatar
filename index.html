@@ -265,9 +265,10 @@ input[type=range]{accent-color:var(--accent);width:180px;max-width:100%}
         </div>
       </div>
       <div class="field" id="keyBox" hidden>
-        <span class="label">Claude-Zugang für die Datei-Version</span>
-        <p class="note">Diese Datei läuft außerhalb von claude.ai. Damit Lucía antworten kann, trag deinen Anthropic-API-Schlüssel ein. Er bleibt nur in diesem Browser gespeichert.</p>
-        <div class="row"><input type="password" id="apiKey" placeholder="sk-ant-…" autocomplete="off" style="flex:1;min-width:0"><button class="btn" id="saveKey" type="button">Speichern</button></div>
+        <span class="label">Lucías Gehirn verbinden (einmalig)</span>
+        <p class="note">Kostenlos mit Google Gemini: Öffne <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>, melde dich mit deinem Google-Konto an, tippe auf „API-Schlüssel erstellen“ und füge ihn hier ein. Ein Anthropic-Schlüssel (sk-ant-…) funktioniert auch. Der Schlüssel bleibt nur in diesem Browser gespeichert.</p>
+        <div class="row"><input type="password" id="apiKey" placeholder="AIza… oder sk-ant-…" autocomplete="off" style="flex:1;min-width:0"><button class="btn" id="saveKey" type="button">Speichern</button></div>
+        <p class="note" id="keyState"></p>
       </div>
       <div class="warn" id="noClaude" hidden></div>
       <div class="row">
@@ -693,6 +694,43 @@ function listen(onText) {
 }
 function stopListening() { if (mic.on && mic.rec) { try { mic.rec.abort(); } catch {} } }
 
+/* ---------- Free Gemini connection (web version) ---------- */
+const GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.5-flash"];
+async function streamGemini(key, system, history, onText, signal) {
+  const contents = [];
+  for (const m of history) { const role = m.role === "assistant" ? "model" : "user"; const last = contents[contents.length - 1]; if (last && last.role === role) last.parts[0].text += "\n" + m.content; else contents.push({ role, parts: [{ text: m.content }] }); }
+  const body = JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: { maxOutputTokens: 900, temperature: 0.8 } });
+  const known = lsGet("hab-gmodel", "");
+  const order = known ? [known, ...GEMINI_MODELS.filter(m => m !== known)] : GEMINI_MODELS;
+  let lastErr = null;
+  for (const model of order) {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, { method: "POST", signal, headers: { "content-type": "application/json", "x-goog-api-key": key }, body });
+    if (!res.ok) {
+      let m = ""; try { m = (await res.json()).error.message || ""; } catch {}
+      if (res.status === 404 || (res.status === 400 && /model/i.test(m) && !/api key/i.test(m))) { lastErr = { code: "upstream_error", message: m }; continue; }
+      if (res.status === 429) throw { code: "rate_limited", message: m };
+      if (res.status === 400 || res.status === 401 || res.status === 403) throw { code: "bad_key", message: m };
+      throw { code: "upstream_error", message: m };
+    }
+    lsSet("hab-gmodel", model);
+    const reader = res.body.getReader(), dec = new TextDecoder(); let buf = "", text = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
+        const parts = (((ev.candidates || [])[0] || {}).content || {}).parts || [];
+        const add = parts.filter(p => !p.thought).map(p => p.text || "").join("");
+        if (add) { text += add; onText(text); }
+      }
+    }
+    return text;
+  }
+  throw lastErr || { code: "upstream_error" };
+}
+
 /* ---------- Claude connection (artifact runtime, or API key in the file version) ---------- */
 let samplePromise = null;
 const getSample = () => samplePromise || (samplePromise = IN_VIEWER ? window.claude.use("sample").catch(() => null) : Promise.resolve(null));
@@ -705,6 +743,7 @@ async function streamClaude(system, history, onText, signal) {
   }
   const key = apiKey();
   if (!key) throw { code: "no_access" };
+  if (!key.startsWith("sk-ant-")) return streamGemini(key, system, history, onText, signal);
   const msgs = [];
   for (const m of history) { const last = msgs[msgs.length - 1]; if (last && last.role === m.role) last.content += "\n" + m.content; else msgs.push({ role: m.role, content: m.content }); }
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -925,8 +964,9 @@ async function ask(userText) {
   } catch (e) {
     pending.remove();
     const code = e && e.code;
-    const msg = code === "no_access" ? "Lucía braucht Zugang zu Claude. Trag auf der Startseite deinen API-Schlüssel ein."
-      : code === "bad_key" ? "Der API-Schlüssel wurde abgelehnt. Prüf ihn auf der Startseite."
+    const msg = code === "no_access" ? "Lucía braucht noch ihr Gehirn. Trag auf der Startseite deinen kostenlosen Gemini-Schlüssel ein."
+      : code === "bad_key" ? "Der Schlüssel wurde abgelehnt. Prüf ihn auf der Startseite." + (e.message ? " (" + e.message + ")" : "")
+      : code === "rate_limited" && !IN_VIEWER ? "Das kostenlose Tageslimit ist gerade erreicht. Warte eine Minute oder versuch es später wieder."
       : code === "not_granted" || code === "sampling_disabled" ? "Lucía darf Claude nicht nutzen. Erlaube den Zugriff über das Berechtigungsmenü dieser Seite und starte den Anruf neu."
       : code === "rate_limited" ? "Gerade sind zu viele Anfragen unterwegs. Warte kurz und schick deine Nachricht noch einmal."
       : code === "cancelled" || (e && e.name === "AbortError") ? null
@@ -1046,7 +1086,7 @@ function seg(container, items, current, onPick) {
 }
 function showAccessNote() {
   const n = $("#noClaude"); n.hidden = false;
-  n.textContent = IN_VIEWER ? "Lucía braucht Claude zum Antworten. Erlaube der Seite den Zugriff auf Claude, wenn danach gefragt wird." : "Trag oben deinen Anthropic-API-Schlüssel ein, damit Lucía antworten kann.";
+  n.textContent = IN_VIEWER ? "Lucía braucht Claude zum Antworten. Erlaube der Seite den Zugriff auf Claude, wenn danach gefragt wird." : "Trag oben deinen kostenlosen Gemini-Schlüssel ein, damit Lucía antworten kann.";
 }
 function renderMiniGoal() {
   const c = todayCount(), g = state.profile.goal;
@@ -1084,6 +1124,7 @@ function renderLobby() {
   $("#badges").replaceChildren(...MILESTONES.map(([k, n]) => el("span", { class: "badge" + (p.ms.includes(k) ? " on" : ""), text: (p.ms.includes(k) ? "✓ " : "") + n })));
   $("#streakTop").replaceChildren(el("span", { class: "badge" + (s ? " on" : ""), text: s ? `${s} Tage in Folge` : "Starte deine Serie" }));
   $("#keyBox").hidden = IN_VIEWER; $("#apiKey").value = apiKey() ? "••••••••" : "";
+  $("#keyState").textContent = apiKey() ? (apiKey().startsWith("sk-ant-") ? "Verbunden mit Claude." : "Verbunden mit Google Gemini (kostenlos).") : "";
 }
 
 /* ---------- Wire up ---------- */
